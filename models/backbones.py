@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+from .fusion import LearnableFusion
 
 from .attention import CBAM
 
@@ -48,6 +49,7 @@ class XceptionWithCBAM(nn.Module):
         # Insert CBAM modules into mid- and high-level feature maps
         self.cbam_stage3 = CBAM(728)
         self.cbam_stage4 = CBAM(2048)
+        self.feature_dim = 2048
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -157,3 +159,28 @@ class DCTStream(nn.Module):
         x = x.view(x.size(0), -1)
 
         return x
+
+class DualStreamModel(nn.Module):
+    """Complete dual-stream model with spatial and frequency streams"""
+    def __init__(self, num_classes=2, pretrained=True):
+        super(DualStreamModel, self).__init__()
+        self.spatial_stream = XceptionWithCBAM(pretrained=pretrained)
+        self.frequency_stream = DCTStream()
+        self.fusion = LearnableFusion(
+            spatial_dim=self.spatial_stream.feature_dim,
+            frequency_dim=self.frequency_stream.feature_dim,
+            fusion_dim=512
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+    
+    def forward(self, rgb_input, dct_input):
+        spatial_features = self.spatial_stream(rgb_input)
+        frequency_features = self.frequency_stream(dct_input)
+        fused_features, attention_weights = self.fusion(spatial_features, frequency_features)
+        logits = self.classifier(fused_features)
+        return logits, attention_weights
