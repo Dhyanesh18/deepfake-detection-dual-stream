@@ -8,78 +8,37 @@ from .attention import CBAM
 
 
 class XceptionWithCBAM(nn.Module):
-    """
-    Xception backbone enhanced with CBAM modules at stages 3 and 4.
+    def __init__(self, pretrained=True):
+        super().__init__()
 
-    This architecture integrates Convolutional Block Attention Modules (CBAM)
-    into the mid- and high-level stages of the Xception model to improve
-    spatial and channel attention. The goal is to enhance feature representation
-    for fine-grained recognition tasks such as facial analysis.
+        # Use timm's feature extractor
+        self.backbone = timm.create_model(
+            'xception',
+            pretrained=pretrained,
+            features_only=True  # gives list of feature maps
+        )
 
-    Stage Overview (for input ~300x300):
-        - Stage 0: 64 channels  @ 150x150 (stride 2)  - Low-level features
-        - Stage 1: 128 channels @ 75x75   (stride 4)  - Edges, textures
-        - Stage 2: 256 channels @ 38x38   (stride 8)  - Local patterns
-        - Stage 3: 728 channels @ 19x19   (stride 16) - Object parts [CBAM HERE]
-        - Stage 4: 2048 channels @ 10x10  (stride 32) - High-level semantics [CBAM HERE]
+        # Feature channel dimensions from timm (for xception)
+        feature_channels = self.backbone.feature_info.channels()
+        # For xception → [64, 128, 256, 728, 2048]
 
-    CBAM placement rationale:
-        - Stage 3: Focuses on mid-level spatial details (e.g., eyes, nose, mouth)
-        - Stage 4: Captures global semantic information (e.g., face composition)
-        - This combination provides a good accuracy-speed tradeoff.
+        self.cbam_stage3 = CBAM(feature_channels[-2])  # 728
+        self.cbam_stage4 = CBAM(feature_channels[-1])  # 2048
 
-    Args:
-        pretrained (bool, optional): If True, loads pretrained ImageNet weights
-            for the Xception backbone. Defaults to True.
-    """
+        self.feature_dim = feature_channels[-1]  # 2048
 
-    def __init__(self, pretrained: bool = True):
-        super(XceptionWithCBAM, self).__init__()
+    def forward(self, x):
+        # Get intermediate feature maps
+        feats = self.backbone(x)
+        x3 = feats[-2]  # 728 channels
+        x4 = feats[-1]  # 2048 channels
 
-        # Load pretrained Xception model from timm
-        base_model = timm.create_model('xception', pretrained=pretrained, features_only=True)
+        # Apply CBAM
+        x3 = self.cbam_stage3(x3)
+        x4 = self.cbam_stage4(x4)
 
-        # Divide Xception backbone into 5 stages for modularity and clarity
-        self.stage0 = nn.Sequential(*list(base_model.children())[0:2])
-        self.stage1 = nn.Sequential(*list(base_model.children())[2:4])
-        self.stage2 = nn.Sequential(*list(base_model.children())[4:6])
-        self.stage3 = nn.Sequential(*list(base_model.children())[6:12])
-        self.stage4 = nn.Sequential(*list(base_model.children())[12:])
-
-        # Insert CBAM modules into mid- and high-level feature maps
-        self.cbam_stage3 = CBAM(728)
-        self.cbam_stage4 = CBAM(2048)
-        self.feature_dim = 2048
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the Xception backbone with CBAM enhancements.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, 3, H, W),
-                where H and W are typically 300x300.
-
-        Returns:
-            torch.Tensor: Global feature vector of shape (B, 2048),
-                representing semantically enriched image descriptors.
-        """
-        # Early feature extraction
-        x = self.stage0(x)
-        x = self.stage1(x)
-        x = self.stage2(x)
-
-        # Mid-level features with CBAM
-        x = self.stage3(x)
-        x = self.cbam_stage3(x)
-
-        # High-level features with CBAM
-        x = self.stage4(x)
-        x = self.cbam_stage4(x)
-
-        # Global average pooling
-        x = F.adaptive_avg_pool2d(x, 1)
-        x = x.view(x.size(0), -1)
-
+        # Global average pooling → feature vector
+        x = F.adaptive_avg_pool2d(x4, 1).view(x4.size(0), -1)
         return x
 
 
@@ -126,9 +85,10 @@ class DCTStream(nn.Module):
         )
 
         # CBAM attention modules for progressive refinement
-        self.cbam1 = CBAM(512)
-        self.cbam2 = CBAM(512)
-        self.cbam3 = CBAM(512)
+        self.cbam1 = CBAM(128)  
+        self.cbam2 = CBAM(256)  
+        self.cbam3 = CBAM(512)  
+        self.feature_dim = 512
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -167,8 +127,8 @@ class DualStreamModel(nn.Module):
         self.spatial_stream = XceptionWithCBAM(pretrained=pretrained)
         self.frequency_stream = DCTStream()
         self.fusion = LearnableFusion(
-            spatial_dim=self.spatial_stream.feature_dim,
-            frequency_dim=self.frequency_stream.feature_dim,
+            spatial_dim=2048,
+            frequency_dim=512,
             fusion_dim=512
         )
         self.classifier = nn.Sequential(

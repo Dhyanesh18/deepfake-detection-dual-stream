@@ -33,6 +33,8 @@ class LearnableFusion(nn.Module):
 
         attention_weights = self.attention(concat_features)
 
-        fused = (attention_weights[:, 0:1]*spatial_features + attention_weights[:, 1:2]*frequency_features)
+        fused = (attention_weights[:, 0:1]*spatial_projection +
+            attention_weights[:, 1:2]*frequency_projection)
+
 
         return fused, attention_weights
