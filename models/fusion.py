@@ -6,16 +6,19 @@ class LearnableFusion(nn.Module):
     def __init__(self, spatial_dim, frequency_dim, fusion_dim=512):
         super(LearnableFusion, self).__init__()
         
+        # Balance spatial stream - project down in two steps
         self.spatial_proj = nn.Sequential(
-            nn.Linear(spatial_dim, fusion_dim),
+            nn.Linear(spatial_dim, 512),
             nn.ReLU(),
-            nn.Dropout(0.5)
+            nn.Linear(512, fusion_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3)
         )
 
         self.frequency_proj = nn.Sequential(
             nn.Linear(frequency_dim, fusion_dim),
             nn.ReLU(),
-            nn.Dropout(0.5)
+            nn.Dropout(0.3)
         )
 
         self.attention = nn.Sequential(
@@ -35,6 +38,5 @@ class LearnableFusion(nn.Module):
 
         fused = (attention_weights[:, 0:1]*spatial_projection +
             attention_weights[:, 1:2]*frequency_projection)
-
 
         return fused, attention_weights
