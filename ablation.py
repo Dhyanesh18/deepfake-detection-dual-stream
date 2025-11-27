@@ -1,25 +1,35 @@
+"""
+Ablation Study Script
+Systematically evaluates each component's contribution to the model
+Uses pre-extracted face images (no video processing or MTCNN needed)
+"""
+
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
-import numpy as np
 from scipy.fftpack import dct
-import os
 from glob import glob
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-from facenet_pytorch import MTCNN
 import json
 from datetime import datetime
 
-from models import XceptionBaseline, DualStreamModel
+# Import models
+from models import XceptionBaseline
+from models.backbones import XceptionWithCBAM, DCTStream, DualStreamModel
 
+
+# ==================== DATASET CLASS (No MTCNN - Pre-extracted faces) ====================
 
 def dct2d(block):
     """Apply 2D DCT on an image channel"""
     return dct(dct(block.T, norm="ortho").T, norm="ortho")
+
 
 def rgb_to_dct(image):
     """Convert RGB image to DCT domain"""
@@ -34,104 +44,119 @@ def rgb_to_dct(image):
     dct_image = np.stack(dct_channels, axis=0)
     return torch.from_numpy(dct_image).float()
 
+
 def normalize_dct(dct_tensor):
     """Normalize DCT coefficients"""
     mean = dct_tensor.mean(dim=(1, 2), keepdim=True)
     std = dct_tensor.std(dim=(1, 2), keepdim=True)
     return (dct_tensor - mean) / (std + 1e-8)
 
-# Dataset Class
+
 class DeepfakeDataset(Dataset):
+    """
+    Dataset for deepfake detection using pre-extracted face images
+    No MTCNN needed - images are already cropped faces
+    """
     def __init__(self, real_dir, fake_dir, transform=None, mode='train'):
         self.transform = transform
         self.mode = mode
         
-        self.mtcnn = MTCNN(
-            keep_all=False, 
-            device='cuda' if torch.cuda.is_available() else 'cpu',
-            post_process=False
-        )
+        # Get all image paths
+        real_images = sorted(glob(os.path.join(real_dir, '*.png')) + 
+                           glob(os.path.join(real_dir, '*.jpg')))
+        fake_images = sorted(glob(os.path.join(fake_dir, '*.png')) + 
+                           glob(os.path.join(fake_dir, '*.jpg')))
         
-        self.real_images = glob(os.path.join(real_dir, '*.png')) + \
-                            glob(os.path.join(real_dir, '*.jpg'))
-        self.fake_images = glob(os.path.join(fake_dir, '*.png')) + \
-                            glob(os.path.join(fake_dir, '*.jpg'))
+        # Create dataset: (path, label)
+        self.samples = [(img, 0) for img in real_images] + [(img, 1) for img in fake_images]
         
-        self.image_paths = self.real_images + self.fake_images
-        self.labels = [0] * len(self.real_images) + [1] * len(self.fake_images)
-        
-        print(f"{mode} dataset: {len(self.real_images)} real, {len(self.fake_images)} fake")
+        print(f"{mode.upper()} - Real: {len(real_images)}, Fake: {len(fake_images)}, Total: {len(self.samples)}")
     
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.samples)
     
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        label = self.labels[idx]
-        
-        image = Image.open(img_path).convert('RGB')
+        img_path, label = self.samples[idx]
         
         try:
-            face_tensor = self.mtcnn(image)
-            if face_tensor is None:
-                face = transforms.Resize((299, 299))(image)
-            else:
-                face = transforms.ToPILImage()(face_tensor)
-                face = transforms.Resize((299, 299))(face)
-        except:
-            face = transforms.Resize((299, 299))(image)
-        
-        if self.transform and self.mode == 'train':
-            face = self.transform(face)
-        
-        face_tensor = transforms.ToTensor()(face)
-        
-        normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406], 
-            std=[0.229, 0.224, 0.225]
-        )
-        rgb_tensor = normalize(face_tensor)
-        
-        dct_tensor = rgb_to_dct(face_tensor * 255.0)
-        dct_tensor = normalize_dct(dct_tensor)
-        
-        return rgb_tensor, dct_tensor, label
+            # Load pre-extracted face image
+            image = Image.open(img_path).convert('RGB')
+            
+            # Resize to 160x160 (standard face size)
+            image = transforms.Resize((160, 160))(image)
+            
+            # Apply augmentations (only during training, before tensor conversion)
+            if self.transform and self.mode == 'train':
+                image = self.transform(image)
+            
+            # Convert to tensor [0, 1]
+            face_tensor = transforms.ToTensor()(image)
+            
+            # Normalize RGB for spatial stream (ImageNet stats)
+            normalize = transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], 
+                std=[0.229, 0.224, 0.225]
+            )
+            rgb_tensor = normalize(face_tensor)
+            
+            # Convert to DCT domain for frequency stream
+            # Scale to [0, 255] for DCT conversion
+            dct_tensor = rgb_to_dct(face_tensor * 255.0)
+            dct_tensor = normalize_dct(dct_tensor)
+            
+            return rgb_tensor, dct_tensor, label
+            
+        except Exception as e:
+            print(f"Error loading {img_path}: {e}")
+            # Return a random valid sample
+            return self.__getitem__(np.random.randint(0, len(self)))
 
-# ============================================================================
-# Training & Evaluation Functions
-# ============================================================================
+
+# ==================== TRAINING & EVALUATION FUNCTIONS ====================
 
 def train_epoch(model, dataloader, criterion, optimizer, device, model_type='dual'):
+    """Train for one epoch"""
     model.train()
     running_loss = 0.0
     all_preds = []
     all_labels = []
     
-    for batch in tqdm(dataloader, desc='Training', leave=False):
+    progress_bar = tqdm(dataloader, desc='Training', leave=False)
+    for batch in progress_bar:
         rgb, dct, labels = batch
-        rgb, dct, labels = rgb.to(device), dct.to(device), labels.to(device)
+        rgb = rgb.to(device)
+        dct = dct.to(device)
+        labels = labels.to(device)
         
         optimizer.zero_grad()
         
-        if model_type == 'dual':
-            outputs, _ = model(rgb, dct)
-        else:
+        # Forward pass
+        if model_type == 'baseline':
             outputs = model(rgb)
+        else:  # dual stream
+            outputs, _ = model(rgb, dct)
         
         loss = criterion(outputs, labels)
+        
+        # Backward pass
         loss.backward()
         optimizer.step()
         
-        running_loss += loss.item()
-        preds = torch.argmax(outputs, dim=1)
-        all_preds.extend(preds.cpu().numpy())
+        # Calculate accuracy
+        _, predicted = torch.max(outputs, 1)
+        all_preds.extend(predicted.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
+        
+        running_loss += loss.item()
+        progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
     
     epoch_loss = running_loss / len(dataloader)
     epoch_acc = accuracy_score(all_labels, all_preds)
     return epoch_loss, epoch_acc
 
+
 def evaluate(model, dataloader, criterion, device, model_type='dual'):
+    """Evaluate model on validation/test set"""
     model.eval()
     running_loss = 0.0
     all_preds = []
@@ -139,60 +164,235 @@ def evaluate(model, dataloader, criterion, device, model_type='dual'):
     all_probs = []
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc='Evaluating', leave=False):
+        progress_bar = tqdm(dataloader, desc='Evaluating', leave=False)
+        for batch in progress_bar:
             rgb, dct, labels = batch
-            rgb, dct, labels = rgb.to(device), dct.to(device), labels.to(device)
+            rgb = rgb.to(device)
+            dct = dct.to(device)
+            labels = labels.to(device)
             
-            if model_type == 'dual':
-                outputs, _ = model(rgb, dct)
-            else:
+            # Forward pass
+            if model_type == 'baseline':
                 outputs = model(rgb)
+            else:  # dual stream
+                outputs, _ = model(rgb, dct)
             
             loss = criterion(outputs, labels)
-            running_loss += loss.item()
             
+            # Get predictions
             probs = torch.softmax(outputs, dim=1)
-            preds = torch.argmax(outputs, dim=1)
+            _, predicted = torch.max(outputs, 1)
             
-            all_preds.extend(preds.cpu().numpy())
+            all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs[:, 1].cpu().numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy())  # Probability of fake class
+            
+            running_loss += loss.item()
     
+    # Convert to numpy arrays
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    all_probs = np.array(all_probs)
+    
+    # Debug: Check unique values
+    unique_labels = np.unique(all_labels)
+    unique_preds = np.unique(all_preds)
+    
+    # Calculate metrics
     loss = running_loss / len(dataloader)
     accuracy = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, zero_division=0)
-    recall = recall_score(all_labels, all_preds, zero_division=0)
-    f1 = f1_score(all_labels, all_preds, zero_division=0)
     
-    try:
-        auc = roc_auc_score(all_labels, all_probs)
-    except ValueError:
+    # Check if this is truly binary classification
+    if len(unique_labels) > 2 or len(unique_preds) > 2:
+        print(f"\nWarning: Detected more than 2 classes!")
+        print(f"Unique labels: {unique_labels}")
+        print(f"Unique predictions: {unique_preds}")
+        # Use weighted average for multiclass
+        precision = precision_score(all_labels, all_preds, average='weighted', zero_division=0)
+        recall = recall_score(all_labels, all_preds, average='weighted', zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average='weighted', zero_division=0)
+        auc = 0.0  # AUC not well-defined for multiclass
+    elif len(unique_preds) < 2:
+        # Model is predicting only one class
+        print(f"\nWarning: Model predicting only class {unique_preds[0]}")
+        precision = 0.0
+        recall = 0.0
+        f1 = 0.0
         auc = 0.0
+    else:
+        # Binary classification - use binary metrics
+        # Make sure labels are actually 0 and 1
+        assert set(unique_labels).issubset({0, 1}), f"Labels must be 0 or 1, got {unique_labels}"
+        assert set(unique_preds).issubset({0, 1}), f"Predictions must be 0 or 1, got {unique_preds}"
+        
+        precision = precision_score(all_labels, all_preds, average='binary', pos_label=1, zero_division=0)
+        recall = recall_score(all_labels, all_preds, average='binary', pos_label=1, zero_division=0)
+        f1 = f1_score(all_labels, all_preds, average='binary', pos_label=1, zero_division=0)
+        
+        # Handle AUC calculation
+        try:
+            if len(unique_labels) >= 2:
+                auc = roc_auc_score(all_labels, all_probs)
+            else:
+                auc = 0.0
+        except ValueError as e:
+            print(f"\nWarning: Could not calculate AUC - {e}")
+            auc = 0.0
     
-    return loss, accuracy, precision, recall, f1, auc
+    return {
+        'loss': loss,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc
+    }
 
-# ============================================================================
-# Main Ablation Study Function
-# ============================================================================
+
+# ==================== ABLATION STUDY CONFIGURATIONS ====================
+
+def get_ablation_configs():
+    """Define all ablation study configurations"""
+    configs = {
+        'xception_cbam': {
+            'name': 'Xception + CBAM',
+            'model_type': 'xception_cbam',
+            'description': 'Xception with CBAM attention modules'
+        },
+        'dual_full': {
+            'name': 'Full Model (All Components)',
+            'model_type': 'dual',
+            'description': 'Complete model with all proposed components'
+        }
+    }
+    return configs
+
+
+def create_model(config_name, num_classes=2, device='cuda'):
+    """Create model based on configuration"""
+    
+    if config_name == 'baseline':
+        model = XceptionBaseline(num_classes=num_classes, pretrained=True)
+        model_type = 'baseline'
+    
+    elif config_name == 'xception_cbam':
+        # Create Xception with CBAM but no DCT stream
+        base_model = XceptionWithCBAM(pretrained=True)
+        
+        # Get the feature dimension
+        if hasattr(base_model, 'feature_dim'):
+            feature_dim = base_model.feature_dim
+        else:
+            # Try to infer from a dummy forward pass
+            dummy_input = torch.randn(1, 3, 160, 160).to(device)
+            with torch.no_grad():
+                dummy_output = base_model(dummy_input)
+                if isinstance(dummy_output, tuple):
+                    dummy_output = dummy_output[0]
+                feature_dim = dummy_output.shape[1] if len(dummy_output.shape) > 1 else dummy_output.shape[0]
+        
+        # Create a wrapper model with classifier
+        class XceptionCBAMClassifier(nn.Module):
+            def __init__(self, backbone, feature_dim, num_classes):
+                super().__init__()
+                self.backbone = backbone
+                self.avgpool = nn.AdaptiveAvgPool2d(1)
+                self.flatten = nn.Flatten()
+                self.fc = nn.Linear(feature_dim, num_classes)
+            
+            def forward(self, x):
+                x = self.backbone(x)
+                if len(x.shape) == 4:  # (B, C, H, W)
+                    x = self.avgpool(x)
+                x = self.flatten(x)
+                x = self.fc(x)
+                return x
+        
+        model = XceptionCBAMClassifier(base_model, feature_dim, num_classes)
+        model_type = 'baseline'
+    
+    elif config_name == 'dual_simple':
+        # Dual stream with simple concatenation
+        model = DualStreamModel(num_classes=num_classes, pretrained=True)
+        model_type = 'dual'
+    
+    elif config_name == 'dual_learnable':
+        # Import learnable fusion model if available
+        try:
+            from models.fusion import LearnableFusion
+            model = DualStreamModel(num_classes=num_classes, pretrained=True)
+            model_type = 'dual'
+        except ImportError:
+            print("LearnableFusion not available, using DualStreamModel")
+            model = DualStreamModel(num_classes=num_classes, pretrained=True)
+            model_type = 'dual'
+    
+    elif config_name == 'dual_full':
+        # Full model with all components
+        model = DualStreamModel(num_classes=num_classes, pretrained=True)
+        model_type = 'dual'
+    
+    else:
+        raise ValueError(f"Unknown config: {config_name}")
+    
+    model = model.to(device)
+    
+    # Verify output shape
+    dummy_input = torch.randn(2, 3, 160, 160).to(device)
+    with torch.no_grad():
+        if model_type == 'baseline':
+            dummy_output = model(dummy_input)
+        else:
+            dummy_dct = torch.randn(2, 3, 160, 160).to(device)
+            dummy_output, _ = model(dummy_input, dummy_dct)
+    
+    assert dummy_output.shape[1] == num_classes, \
+        f"Model output shape {dummy_output.shape} doesn't match num_classes={num_classes}"
+    
+    print(f"Model output shape verified: {dummy_output.shape} (batch_size, {num_classes})")
+    
+    return model, model_type
+
+
+# ==================== MAIN ABLATION STUDY ====================
 
 def run_ablation_study(
-    train_real_dir, train_fake_dir,
-    val_real_dir, val_fake_dir,
-    test_real_dir, test_fake_dir,
+    dataset_root='data_dfdc',
+    output_dir='ablation_results',
     batch_size=16,
-    epochs=15,
+    epochs=10,
     learning_rate=1e-4
 ):
-    """
-    Run comprehensive ablation study
+    """Run complete ablation study"""
     
-    Configurations tested:
-    1. Baseline: XceptionNet only (spatial stream)
-    2. Dual-Stream (Full): Both streams + CBAM + Learnable Fusion
-    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_file = os.path.join(output_dir, f'ablation_results_{timestamp}.json')
     
+    # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}\n")
+    print(f"\n{'='*70}")
+    print(f"ABLATION STUDY - Pre-extracted Face Images")
+    print(f"{'='*70}")
+    print(f"Device: {device}")
+    print(f"Dataset: {dataset_root}")
+    print(f"Batch Size: {batch_size}")
+    print(f"Epochs: {epochs}")
+    print(f"Learning Rate: {learning_rate}")
+    print(f"{'='*70}\n")
+    
+    # Check dataset
+    if not os.path.exists(dataset_root):
+        raise ValueError(f"Dataset not found at {dataset_root}")
+    
+    # Dataset paths
+    train_real = os.path.join(dataset_root, 'train', 'real')
+    train_fake = os.path.join(dataset_root, 'train', 'fake')
+    val_real = os.path.join(dataset_root, 'val', 'real')
+    val_fake = os.path.join(dataset_root, 'val', 'fake')
+    test_real = os.path.join(dataset_root, 'test', 'real')
+    test_fake = os.path.join(dataset_root, 'test', 'fake')
     
     # Augmentation for training
     train_transform = transforms.Compose([
@@ -203,207 +403,170 @@ def run_ablation_study(
     
     # Create datasets
     print("Loading datasets...")
-    train_dataset = DeepfakeDataset(train_real_dir, train_fake_dir, 
-                                   transform=train_transform, mode='train')
-    val_dataset = DeepfakeDataset(val_real_dir, val_fake_dir, mode='val')
-    test_dataset = DeepfakeDataset(test_real_dir, test_fake_dir, mode='test')
+    train_dataset = DeepfakeDataset(train_real, train_fake, transform=train_transform, mode='train')
+    val_dataset = DeepfakeDataset(val_real, val_fake, mode='val')
+    test_dataset = DeepfakeDataset(test_real, test_fake, mode='test')
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, 
-                             shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, 
-                           shuffle=False, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, 
-                            shuffle=False, num_workers=4, pin_memory=True)
+    # Create dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                             num_workers=8, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
+                           num_workers=8, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
+                            num_workers=8, pin_memory=True)
     
-    criterion = nn.CrossEntropyLoss()
+    print(f"Datasets loaded successfully\n")
+    
+    # Get ablation configurations
+    configs = get_ablation_configs()
     
     # Store results
-    results = {
-        'experiment_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'hyperparameters': {
-            'batch_size': batch_size,
-            'epochs': epochs,
-            'learning_rate': learning_rate
-        },
-        'configurations': {}
-    }
+    all_results = {}
     
-    # Configuration 1: Baseline (Spatial Only - XceptionNet)
-    print("\n" + "="*70)
-    print("CONFIGURATION 1: Baseline (XceptionNet - Spatial Stream Only)")
-    print("="*70)
-    
-    model = XceptionBaseline(num_classes=2, pretrained=True).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=3, factor=0.5, verbose=True
-    )
-    
-    best_val_acc = 0.0
-    for epoch in range(epochs):
-        print(f"\nEpoch {epoch+1}/{epochs}")
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, 
-                                            optimizer, device, 'baseline')
-        val_loss, val_acc, val_prec, val_rec, val_f1, val_auc = evaluate(
-            model, val_loader, criterion, device, 'baseline'
-        )
-        print(f"Train: Loss={train_loss:.4f}, Acc={train_acc:.4f}")
-        print(f"Val: Acc={val_acc:.4f}, Prec={val_prec:.4f}, Rec={val_rec:.4f}, "
-                f"F1={val_f1:.4f}, AUC={val_auc:.4f}")
+    # Run each configuration
+    for config_key, config_info in configs.items():
+        print(f"\n{'='*70}")
+        print(f"Running: {config_info['name']}")
+        print(f"Description: {config_info['description']}")
+        print(f"{'='*70}\n")
         
-        scheduler.step(val_acc)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), 'ablation_baseline.pth')
-            print(f"Saved best baseline model (acc: {best_val_acc:.4f})")
-    
-    # Test baseline
-    model.load_state_dict(torch.load('ablation_baseline.pth'))
-    test_loss, test_acc, test_prec, test_rec, test_f1, test_auc = evaluate(
-        model, test_loader, criterion, device, 'baseline'
-    )
-    
-    results['configurations']['baseline'] = {
-        'description': 'XceptionNet spatial stream only',
-        'test_accuracy': float(test_acc),
-        'test_precision': float(test_prec),
-        'test_recall': float(test_rec),
-        'test_f1': float(test_f1),
-        'test_auc': float(test_auc)
-    }
-    
-    print(f"\nBaseline Test Results:")
-    print(f"  Accuracy: {test_acc:.4f}, Precision: {test_prec:.4f}, Recall: {test_rec:.4f}")
-    print(f"  F1: {test_f1:.4f}, AUC: {test_auc:.4f}")
-    
-
-    # Configuration 2: Dual-Stream (Full Model)
-    print("\n" + "="*70)
-    print("CONFIGURATION 2: Dual-Stream (Full Model with CBAM + Learnable Fusion)")
-    print("="*70)
-    
-    model = DualStreamModel(num_classes=2, pretrained=True).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', patience=3, factor=0.5, verbose=True
-    )
-    
-    best_val_acc = 0.0
-    for epoch in range(epochs):
-        print(f"\nEpoch {epoch+1}/{epochs}")
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, 
-                                            optimizer, device, 'dual')
-        val_loss, val_acc, val_prec, val_rec, val_f1, val_auc = evaluate(
-            model, val_loader, criterion, device, 'dual'
-        )
-        print(f"Train: Loss={train_loss:.4f}, Acc={train_acc:.4f}")
-        print(f"Val: Acc={val_acc:.4f}, Prec={val_prec:.4f}, Rec={val_rec:.4f}, "
-                f"F1={val_f1:.4f}, AUC={val_auc:.4f}")
+        # Create model
+        model, model_type = create_model(config_key, num_classes=2, device=device)
         
-        scheduler.step(val_acc)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), 'ablation_dual_full.pth')
-            print(f"Saved best dual-stream model (acc: {best_val_acc:.4f})")
+        # Count parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}\n")
+        
+        # Setup training
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', 
+                                                         patience=2, factor=0.5, verbose=True)
+        
+        # Training history
+        history = {
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': [],
+            'val_metrics': []
+        }
+        
+        best_val_acc = 0.0
+        best_model_path = os.path.join(output_dir, f'{config_key}_best.pth')
+        
+        # Training loop
+        for epoch in range(epochs):
+            print(f"\nEpoch {epoch+1}/{epochs}")
+            print("-" * 70)
+            
+            # Train
+            train_loss, train_acc = train_epoch(
+                model, train_loader, criterion, optimizer, device, model_type
+            )
+            
+            # Validate
+            val_metrics = evaluate(model, val_loader, criterion, device, model_type)
+            
+            # Update scheduler
+            scheduler.step(val_metrics['accuracy'])
+            
+            # Get current learning rate
+            current_lr = optimizer.param_groups[0]['lr']
+            
+            # Save history
+            history['train_loss'].append(train_loss)
+            history['train_acc'].append(train_acc)
+            history['val_loss'].append(val_metrics['loss'])
+            history['val_acc'].append(val_metrics['accuracy'])
+            history['val_metrics'].append(val_metrics)
+            
+            # Print epoch results
+            print(f"Train - Loss: {train_loss:.4f}, Acc: {train_acc:.4f} ({train_acc*100:.2f}%)")
+            print(f"Val   - Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['accuracy']:.4f} ({val_metrics['accuracy']*100:.2f}%)")
+            print(f"        Prec: {val_metrics['precision']:.4f}, Rec: {val_metrics['recall']:.4f}, "
+                  f"F1: {val_metrics['f1']:.4f}, AUC: {val_metrics['auc']:.4f}")
+            print(f"        Learning Rate: {current_lr:.2e}")
+            
+            # Save best model
+            if val_metrics['accuracy'] > best_val_acc:
+                best_val_acc = val_metrics['accuracy']
+                torch.save(model.state_dict(), best_model_path)
+                print(f"✓ Saved best model (Val Acc: {best_val_acc:.4f})")
+        
+        # Load best model for testing
+        print(f"\nLoading best model for testing...")
+        model.load_state_dict(torch.load(best_model_path))
+        
+        # Test evaluation
+        print("Testing...")
+        test_metrics = evaluate(model, test_loader, criterion, device, model_type)
+        
+        print(f"\n{'='*70}")
+        print(f"FINAL TEST RESULTS - {config_info['name']}")
+        print(f"{'='*70}")
+        print(f"Accuracy:  {test_metrics['accuracy']:.4f} ({test_metrics['accuracy']*100:.2f}%)")
+        print(f"Precision: {test_metrics['precision']:.4f}")
+        print(f"Recall:    {test_metrics['recall']:.4f}")
+        print(f"F1-Score:  {test_metrics['f1']:.4f}")
+        print(f"AUC-ROC:   {test_metrics['auc']:.4f}")
+        print(f"{'='*70}\n")
+        
+        # Store results
+        all_results[config_key] = {
+            'config': config_info,
+            'model_params': {
+                'total': int(total_params),
+                'trainable': int(trainable_params)
+            },
+            'training_history': history,
+            'best_val_accuracy': float(best_val_acc),
+            'test_metrics': {k: float(v) for k, v in test_metrics.items()}
+        }
+        
+        # Save intermediate results
+        with open(results_file, 'w') as f:
+            json.dump(all_results, f, indent=2)
+        
+        print(f"Intermediate results saved to: {results_file}\n")
     
-    # Test full model
-    model.load_state_dict(torch.load('ablation_dual_full.pth'))
-    test_loss, test_acc, test_prec, test_rec, test_f1, test_auc = evaluate(
-        model, test_loader, criterion, device, 'dual'
-    )
-    
-    results['configurations']['dual_full'] = {
-        'description': 'Dual-stream with CBAM and learnable fusion',
-        'test_accuracy': float(test_acc),
-        'test_precision': float(test_prec),
-        'test_recall': float(test_rec),
-        'test_f1': float(test_f1),
-        'test_auc': float(test_auc)
-    }
-    
-    print(f"\nDual-Stream Full Model Test Results:")
-    print(f"  Accuracy: {test_acc:.4f}, Precision: {test_prec:.4f}, Recall: {test_rec:.4f}")
-    print(f"  F1: {test_f1:.4f}, AUC: {test_auc:.4f}")
-    
-    # Save Results and Print Summary
-    
-    with open('ablation_results.json', 'w') as f:
-        json.dump(results, f, indent=4)
-    
-    # Print comparison
-    print("\n" + "="*70)
-    print("ABLATION STUDY RESULTS SUMMARY")
-    print("="*70)
-    
-    baseline_acc = results['configurations']['baseline']['test_accuracy']
-    dual_acc = results['configurations']['dual_full']['test_accuracy']
-    improvement = dual_acc - baseline_acc
-    improvement_pct = (improvement / baseline_acc) * 100 if baseline_acc > 0 else 0
-    
-    print(f"\n1. Baseline (Spatial Only)")
-    print(f"   Accuracy: {baseline_acc:.4f} ({baseline_acc*100:.2f}%)")
-    
-    print(f"\n2. Dual-Stream (Full)")
-    print(f"   Accuracy: {dual_acc:.4f} ({dual_acc*100:.2f}%)")
-    print(f"   Improvement: +{improvement:.4f} ({improvement_pct:.2f}% relative improvement)")
-    
-    print("\nDetailed Metrics Comparison:")
+    # Print summary comparison
+    print(f"\n{'='*70}")
+    print("ABLATION STUDY SUMMARY")
+    print(f"{'='*70}\n")
+    print(f"{'Configuration':<35} {'Test Acc':<12} {'F1':<12} {'AUC':<12}")
     print("-" * 70)
-    print(f"{'Configuration':<30} {'Acc':<8} {'Prec':<8} {'Rec':<8} {'F1':<8} {'AUC':<8}")
-    print("-" * 70)
     
-    for config_name, config_data in results['configurations'].items():
-        desc = config_data['description'][:28]
-        print(f"{desc:<30} "
-                f"{config_data['test_accuracy']:<8.4f} "
-                f"{config_data['test_precision']:<8.4f} "
-                f"{config_data['test_recall']:<8.4f} "
-                f"{config_data['test_f1']:<8.4f} "
-                f"{config_data['test_auc']:<8.4f}")
+    for config_key, results in all_results.items():
+        config_name = results['config']['name']
+        test_acc = results['test_metrics']['accuracy']
+        test_f1 = results['test_metrics']['f1']
+        test_auc = results['test_metrics']['auc']
+        print(f"{config_name:<35} {test_acc:<12.4f} {test_f1:<12.4f} {test_auc:<12.4f}")
     
-    print("-" * 70)
-    print(f"\nResults saved to: ablation_results.json")
-    print("="*70)
+    print(f"\n{'='*70}")
+    print(f"Final results saved to: {results_file}")
+    print(f"Model checkpoints saved to: {output_dir}/")
+    print(f"{'='*70}\n")
     
-    return results
+    return all_results
 
-# Main Execution
 
-def main():
-    """Run ablation study with your dataset"""
-    
-    # Configuration - UPDATE THESE PATHS!
-    train_real_dir = 'data_small/train/real'
-    train_fake_dir = 'data_small/train/fake'
-    val_real_dir = 'data_small/val/real'
-    val_fake_dir = 'data_small/val/fake'
-    test_real_dir = 'data_small/test/real'
-    test_fake_dir = 'data_small/test/fake'
-    
-    # Hyperparameters
-    BATCH_SIZE = 16
-    EPOCHS = 15
+if __name__ == '__main__':
+    # Configuration
+    DATASET_ROOT = 'data_dfdc'  # Pre-extracted face images
+    OUTPUT_DIR = 'ablation_results'
+    BATCH_SIZE = 48
+    EPOCHS = 10  # Set to 10-15 for proper ablation study
     LEARNING_RATE = 1e-4
-    
-    print("="*70)
-    print("ABLATION STUDY - Deepfake Detection")
-    print("="*70)
-    print(f"Batch Size: {BATCH_SIZE}")
-    print(f"Epochs: {EPOCHS}")
-    print(f"Learning Rate: {LEARNING_RATE}")
-    print("="*70)
     
     # Run ablation study
     results = run_ablation_study(
-        train_real_dir, train_fake_dir,
-        val_real_dir, val_fake_dir,
-        test_real_dir, test_fake_dir,
+        dataset_root=DATASET_ROOT,
+        output_dir=OUTPUT_DIR,
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
         learning_rate=LEARNING_RATE
     )
-    
-    print("\nAblation study complete!")
-
-if __name__ == '__main__':
-    main()
