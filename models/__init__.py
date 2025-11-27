@@ -16,7 +16,9 @@ except ImportError:
 
 __all__ = [
     'XceptionWithCBAM',
+    'ResNet18WithCBAM',
     'DCTStream', 
+    'DualStreamModelResNet',
     'DualStreamModel',
     'XceptionBaseline',
     'CBAM',

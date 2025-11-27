@@ -1,6 +1,11 @@
 *.zip
 dfdc_train_faces_sample/
 data_dfdc/
+data_celebdf/
 .vscode/
 best_model_dual.pth
 **/__pycache__/
+archive/
+*.pth
+*.json
+*.png
